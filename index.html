@@ -127,6 +127,16 @@ canvas{display:block}
 #zonelbl{font-size:13px;color:#ffd97a;letter-spacing:2px}
 #promptlbl{position:absolute;bottom:112px;left:50%;transform:translateX(-50%);background:rgba(8,14,26,.9);border:2px solid #ffd166;border-radius:12px;padding:8px 16px;font-size:13px;display:none;text-align:center;max-width:86vw}
 #promptlbl.on{display:block}
+/* ---------- autosave indicator ----------
+   Sits in the empty corner opposite the joystick. Deliberately quiet:
+   a player should be able to notice it once, believe it, and then stop
+   seeing it. The failure state is the loud one, because that is the
+   case where they need to do something. */
+#saveind{position:absolute;bottom:14px;right:14px;display:flex;align-items:center;gap:8px;background:rgba(8,14,26,.9);border:2px solid #2b3f63;border-radius:11px;padding:6px 13px;font-size:12px;letter-spacing:.5px;opacity:0;transform:translateY(6px);transition:opacity .3s,transform .3s;pointer-events:none;max-width:72vw;line-height:1.35}
+#saveind.on{opacity:1;transform:translateY(0)}
+#saveind.bad{border-color:#b6263a;color:#ffb9c2;background:rgba(44,8,14,.95)}
+#saveind .dot{width:7px;height:7px;border-radius:50%;background:#7cf08a;box-shadow:0 0 8px rgba(124,240,138,.8);flex:0 0 auto}
+#saveind.bad .dot{background:#ff6a7a;box-shadow:0 0 8px rgba(255,106,122,.8)}
 ::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:#2b4270;border-radius:6px}
 </style>
 </head>
@@ -154,6 +164,7 @@ canvas{display:block}
   <div id="toasts"></div>
   <div id="floaters"></div>
   <div id="promptlbl"></div>
+  <div id="saveind"><span class="dot"></span><span id="saveindtxt">Autosaving…</span></div>
   <div id="bottom">
     <div id="joyzone" class="pe"><div id="joynub"></div></div>
     <div id="actionwrap">
@@ -653,8 +664,36 @@ function dec(o){
   }
   return o;
 }
+/* The indicator is the player's only evidence that closing the tab is
+   safe, so it reports the real outcome of the write rather than firing
+   optimistically before it. A failed save used to be swallowed in
+   silence, which is the one case where the player genuinely needs to be
+   told something -- private-browsing mode and a full quota both land
+   here, and both cost them the whole run if they never find out. */
+var _saveIndT = null, _saveFailed = false;
+function saveIndicator(ok, msg){
+  var el = document.getElementById("saveind");
+  if(!el) return;
+  document.getElementById("saveindtxt").textContent = msg;
+  el.className = ok ? "on" : "on bad";
+  clearTimeout(_saveIndT);
+  /* A failure stays up long enough to be read and acted on. */
+  _saveIndT = setTimeout(function(){ el.className = ok ? "" : "bad"; }, ok ? 1200 : 9000);
+}
 function save(){
-  try{ ST.t = Date.now(); localStorage.setItem(SAVEKEY, JSON.stringify(enc(ST))); }catch(e){}
+  try{
+    ST.t = Date.now();
+    localStorage.setItem(SAVEKEY, JSON.stringify(enc(ST)));
+    _saveFailed = false;
+    saveIndicator(true, "Autosaving…");
+  }catch(e){
+    /* Announce it once per failure run, not every twelve seconds. */
+    if(!_saveFailed){
+      _saveFailed = true;
+      saveIndicator(false, "Can't save — progress will be lost when you close this tab");
+      toast("<b>Saving is blocked</b> in this browser. Private/incognito mode and blocked site data both do this — your progress will not survive closing the tab.","bad");
+    }
+  }
 }
 function load(){
   try{
@@ -4651,6 +4690,12 @@ function init(){
     var away = Math.max(0, (Date.now() - ST.t)/1000);
     var off = offlineEarnings(away);
     if(off){ addCash(off.gain); setTimeout(function(){ showOffline(off); }, 400); }
+    /* Early on there are no managers, so there is no Welcome Back panel
+       and nothing at all confirms the save worked. That is exactly when
+       a player is least sure the game remembers them, so say so. */
+    else setTimeout(function(){
+      toast("💾 <b>Progress restored</b>"+(away>90?(" — you were away "+fmtTime(away)+"."):"."), "good");
+    }, 700);
     ST.weather="clear"; ST.weatherT=0;
   } else {
     cine("SOUR EMPIRE","Your father hands you one dollar, points at the kerb, and goes back inside.\n\n\"Sell lemons,\" he says. \"Sell a LOT of lemons.\"\n\nWalk to the stand on your lawn and press E.");
@@ -4659,6 +4704,11 @@ function init(){
   frame();
   setInterval(save, 20000);
   addEventListener("beforeunload", save);
+  /* beforeunload is the unreliable one: a phone killing a backgrounded
+     tab usually never fires it. visibilitychange does fire the moment
+     the player switches app, which is when a mobile session actually
+     ends, so this is the save that matters most on a phone. */
+  document.addEventListener("visibilitychange", function(){ if(document.visibilityState === "hidden") save(); });
   // periodic checks
   setInterval(function(){ checkUnlocks(); checkCompanions(); }, 3000);
 }
