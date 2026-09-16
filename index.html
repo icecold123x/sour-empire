@@ -2972,7 +2972,7 @@ function updatePlayer(dt){
   var len = Math.hypot(f,s); if(len>1){ f/=len; s/=len; }
   var sp = playerSpeed();
   var cosY=Math.cos(W.camYaw), sinY=Math.sin(W.camYaw);
-  var vx = (s*cosY + f*sinY)*sp, vz = (-s*sinY + f*cosY)*sp;
+  var vx = (-s*cosY + f*sinY)*sp, vz = (s*sinY + f*cosY)*sp;
   var p = W.player.position;
   p.x += vx*dt; p.z += vz*dt;
   var lim = ST.zone==="sewer" ? 17 : 190;
