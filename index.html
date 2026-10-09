@@ -494,7 +494,9 @@ var POWERS = [
  {k:"dilate", n:"Time Dilation", icon:"⏩", max:1, cosmic:[30],
   d:"Everything produces twice as fast. Survives every reset. Costs Cosmic."},
  {k:"forever", n:"Forever Purchase", icon:"🔒", max:1, cosmic:[15],
-  d:"Unlocks Forever slots — lock chosen upgrades through all resets."}
+  d:"Unlocks Forever slots — lock chosen upgrades through all resets."},
+ {k:"autoreb", n:"Standing Orders", icon:"♻️", max:1, cosmic:[20],
+  d:"Rebirths for you once the payout is worth taking. Switch it off in the Rebirth panel. Survives every reset."}
 ];
 
 /* ---------- Grove (orchard) ---------- */
@@ -566,6 +568,14 @@ var BUFF_FALLOFF = 0.55;  /* exponent each buff gets relative to the one above *
 var BUFF_CAP     = {cash:100, spd:10, grow:4, luck:8};
 var MGROW_CAP    = 12;    /* ceiling on one plot's permanent growth-speed multiplier */
 var TREE_YIELD   = 15;    /* fruit one tree gives before it is spent and must be replanted */
+/* Crest asked for a way to buy back some of the lifespan the yield cap
+   took away, and that is fine as long as it stays a ceiling rather than
+   a removal: Deep Roots tops out at +20, so a tree still dies and a
+   freak ★10 is still a windfall rather than an engine. */
+var GROVE_UP = [
+ {k:"roots", n:"Deep Roots", c:4e5, scale:3.2, max:5, per:4,
+  d:"+4 fruit from every tree before it is spent."}
+];
 var STAR_BASE    = 1.95;  /* multiplier per star -- was 1.6, which made ★10 routine */
 var MUT_RARITY   = 1.0;   /* 1 = a good roll picks evenly across the good table; luck still skews it rare */
 
@@ -665,7 +675,7 @@ function newState(){
     phone:{next:120, active:null, muted:false},
     invasion:{active:false, phase:0, t:0, next:900, drops:0, blorp:0, meter:0},
     stats:{clicks:0, pickups:0, deals:0, bestCash:B(0), playtime:0},
-    seen:{}, settings:{sciNotation:false, fx:true, sound:true, skipCine:false, autoeat:true},
+    seen:{}, settings:{sciNotation:false, fx:true, sound:true, skipCine:false, autoeat:true, autoreb:true},
     zone:"home", pos:[0,0,14], paint:{}
   };
 }
@@ -737,6 +747,20 @@ function wipe(){ localStorage.removeItem(SAVEKEY); location.reload(); }
 
 /* =====================  ECONOMY MATH  ===================== */
 function hasPower(k,lv){ return (ST.powers[k]||0) >= (lv||1); }
+/* Powers bought with Cosmic are sold as permanent and the Powers panel
+   says so in as many words. A Descent blanked ST.powers and only then
+   asked hasPower("dilate"), which answers false against the object it
+   just emptied -- so Time Dilation, 30 Cosmic, was quietly destroyed
+   every Descent, and Forever Purchase was destroyed by both deep
+   resets. Carry every Cosmic-bought power across both. */
+function keepCosmicPowers(){
+  var keep = {};
+  for(var i=0;i<POWERS.length;i++){
+    var Pw = POWERS[i];
+    if(Pw.cosmic && ST.powers[Pw.k]) keep[Pw.k] = ST.powers[Pw.k];
+  }
+  return keep;
+}
 function cshop(k){ return ST.cosmicShop[k]||0; }
 
 function evoSpeedMult(){ return Math.pow(EVO_SPEED, ST.evo); }
@@ -763,6 +787,12 @@ function gatewayPickup(){ return ST.gateway>=4?3:1; }
 
 /* Diminishing, capped, and only the best BUFF_SLOTS count -- see the
    Grove balance guards above for why a plain product was unplayable. */
+function groveUp(k){ return (ST.grove.up && ST.grove.up[k]) || 0; }
+function treeYield(){
+  var y = TREE_YIELD;
+  for(var i=0;i<GROVE_UP.length;i++) if(GROVE_UP[i].per) y += GROVE_UP[i].per*groveUp(GROVE_UP[i].k);
+  return y;
+}
 function groveBuffMult(kind){
   var now = nowS(), vals = [], b;
   for(var i=0;i<ST.grove.buffs.length;i++){
@@ -3580,6 +3610,25 @@ function harvestVine(){
 }
 
 /* =====================  RESETS  ===================== */
+/* Standing Orders. Rebirthing the moment it is legal would fire every
+   few seconds for a rounding error, so it waits until the payout is
+   actually worth taking -- a quarter again on top of the Backers you
+   already hold -- and never more than once a cooldown. Both numbers are
+   deliberately visible in the Rebirth panel so nobody has to guess what
+   the robot is waiting for. */
+var AUTOREB_GAIN = 0.25;  /* pending Backers must be at least this share of current Backers */
+var AUTOREB_CD   = 20;    /* seconds between automatic Rebirths */
+var _autoRebAt = 0;
+function autoRebirthTick(){
+  if(!hasPower("autoreb") || ST.settings.autoreb===false) return;
+  var now = nowS();
+  if(now - _autoRebAt < AUTOREB_CD) return;
+  if(!canRebirth()) return;
+  var n = backersFromRebirth();
+  if(n < 1 || n < ST.backers*AUTOREB_GAIN) return;
+  _autoRebAt = now;
+  doRebirth(true);
+}
 /* The Grove used to survive every reset in the game, which made it the
    one permanent power source: breed a good tree once and it paid out
    through Rebirths, Descents and Ascensions alike. It now unwinds in
@@ -3603,12 +3652,15 @@ function groveReset(level){
   }
   if(uprooted) toast("The Grove is bare again — "+uprooted+" tree"+(uprooted>1?"s":"")+" uprooted"+(level>1?", soil stripped":"")+". Your plots, tokens and automation stay.","bad");
 }
-function doRebirth(){
+function doRebirth(auto){
   var n = backersFromRebirth();
-  if(n<1){ toast("Not enough accumulated wealth yet.","bad"); return; }
+  if(n<1){ if(!auto) toast("Not enough accumulated wealth yet.","bad"); return; }
   ST.backers += n; ST.backersLifetime += n; ST.rebirths++;
   groveReset(0);
   softReset(false);
+  /* An automatic Rebirth gets a floater, not a four-second banner and a
+     closed panel -- it happens while the player is doing something else. */
+  if(auto){ floater("♻️ +"+fmtInt(n)+" Backers","#c79bff"); checkUnlocks(); return; }
   banner("REBIRTH — +"+fmtInt(n)+" BACKERS", 4200); sfx("big");
   if(ST.rebirths===1) cine("THE BACKERS ARRIVE","A saucer the size of a shed parks on your lawn. Nobody reacts.\n\nThey liquidate your entire operation and hand you "+fmtInt(n)+" tiny investors who each take 1% interest in everything you will ever earn.\n\nPowers are now available. Build it again — faster.");
   else toast("<b>"+fmtInt(n)+" Backers</b> acquired. Total "+fmtInt(ST.backers)+" (+"+(ST.backers*(ST.secrets.samaritan?2:1))+"% cash).","gold");
@@ -3618,8 +3670,7 @@ function doEvolve(){
   if(!canEvolve()) return;
   ST.evo++;
   ST.backers = 0;
-  ST.powers = {};
-  if(hasPower("dilate")) ST.powers.dilate=1;
+  ST.powers = keepCosmicPowers();
   groveReset(1);
   softReset(true);
   var f = FRUITS[Math.min(9,ST.evo)];
@@ -3630,7 +3681,7 @@ function doEvolve(){
 function doAscend(){
   if(!canAscend()) return;
   ST.asc++; ST.ascCount++;
-  ST.backers=0; ST.evo=0; ST.spire=0; ST.powers = hasPower("dilate")?{dilate:1}:{};
+  ST.backers=0; ST.evo=0; ST.spire=0; ST.powers = keepCosmicPowers();
   ST.foreverSlots++;
   if(ST.gateway>=7) gainCharge();
   if(ST.asc>5) ST.cosmic += Math.floor(1+ (ST.asc-5)*0.5);
@@ -3870,9 +3921,9 @@ function harvestPlot(i, auto){
      windfall to cash in, not a permanent income you breed once and
      ride forever. */
   p.n = (p.n||0)+1;
-  if(p.n >= TREE_YIELD){
+  if(p.n >= treeYield()){
     spendPlot(i);
-    if(!ST.grove.auto.autoplant) toast("Plot "+(i+1)+" is spent after "+TREE_YIELD+" fruit. Replant it.","bad");
+    if(!ST.grove.auto.autoplant) toast("Plot "+(i+1)+" is spent after "+treeYield()+" fruit. Replant it.","bad");
     if(hasPower("taster") && ST.settings.autoeat!==false) autoEat();
     if(ST.grove.auto.autosell) sellAllFruit(true);
     return;
@@ -4310,8 +4361,15 @@ function renderRebirth(){
      "<div class='d'>Rebirth now: <b style='color:#c79bff'>+"+fmtInt(n)+" Backers</b> → +"+fmt(B(((1+(ST.backers+n)*(ST.secrets.samaritan?0.02:0.01))-1)*100))+"% cash</div>"+
      (ST.secrets.samaritan?"<div class='d' style='color:#9cf0b0'>★ Good Samaritan: each Backer pays 2% instead of 1%.</div>":"")+
      "<div class='bar'><i style='width:"+Math.min(100, Math.max(0,(bLog10(bMax(ST.earnedRun,B(1)))/18*100)))+"%'></i></div></div>";
-  h+="<div class='card'><div class='d'><b style='color:#ffb3bd'>RESETS:</b> cash, every income source, every source upgrade (except Forever-locked ones).</div>"+
-     "<div class='d'><b style='color:#9cf0b0'>KEEPS:</b> Backers, Powers, Descents, the Spire, Ascensions, the Grove, Cosmic, secrets, companions.</div></div>";
+  h+="<div class='card'><div class='d'><b style='color:#ffb3bd'>RESETS:</b> cash, every income source, every source upgrade (except Forever-locked ones), plus your fruit basket and any Grove buffs.</div>"+
+     "<div class='d'><b style='color:#9cf0b0'>KEEPS:</b> Backers, Powers, Descents, the Spire, Ascensions, your Grove trees and plots, Cosmic, secrets, companions.</div></div>";
+  if(hasPower("autoreb")){
+    var ar = ST.settings.autoreb!==false;
+    h+="<div class='card'><div class='row'><div style='flex:1'><h3>♻️ Standing Orders</h3><div class='d'>"+
+       (ar?("Rebirthing for you whenever it would add at least <b>"+Math.round(AUTOREB_GAIN*100)+"%</b> to your Backers, at most once every "+AUTOREB_CD+"s."):
+           "Switched off — nothing happens until you press the button yourself.")+"</div></div>"+
+       btn(ar?"ON":"OFF", ar?"gold":"", "toggle",["autoreb"])+"</div></div>";
+  }
   h+="<div style='text-align:center;margin-top:10px'>"+btn("REBIRTH FOR "+fmtInt(n)+" BACKERS","gold","rebirth",[], n<1)+"</div>";
   return h;
 }
@@ -4400,7 +4458,7 @@ function renderPlots(){
     h += "<div class='plot'><div class='pn'>"+SEEDS[p.seed].n+" <span class='pill'>★"+p.stars+"</span></div>";
     h += "<div>"+p.muts.map(function(m){ var mm=MUTS.filter(function(x){return x.n===m;})[0]; return "<span class='mut"+(mm&&mm.good?"":" bad")+"'>"+m+"</span>"; }).join("")+"</div>";
     h += "<div class='d'>value ×"+st.val.toFixed(2)+" · cash ×"+st.cash.toFixed(2)+" · speed ×"+st.spd.toFixed(2)+"</div>";
-    h += "<div class='d'>fruit <b>"+(p.n||0)+" / "+TREE_YIELD+"</b> before the tree is spent</div>";
+    h += "<div class='d'>fruit <b>"+(p.n||0)+" / "+treeYield()+"</b> before the tree is spent</div>";
     h += p.ripe ? ("<div class='pill g'>RIPE</div>"+btn("HARVEST","gold","harvest",[i])) : ("<div class='bar'><i style='width:"+(pr*100)+"%'></i></div><div class='d'>"+fmtTime(growTime(p)-p.t)+"</div>");
     h += btn("REPLANT","","plantui",[i]);
     h += "</div>";
@@ -4409,7 +4467,7 @@ function renderPlots(){
   return h;
 }
 function renderSeeds(){
-  var h="<div class='d' style='margin-bottom:8px'>Seeds cost Grove Tokens. Higher tiers grow slower but sell for far more, and mutations multiply on top. Every tree gives <b>"+TREE_YIELD+" fruit</b> and is then spent — mutations are rolled fresh each time you plant.</div>";
+  var h="<div class='d' style='margin-bottom:8px'>Seeds cost Grove Tokens. Higher tiers grow slower but sell for far more, and mutations multiply on top. Every tree gives <b>"+treeYield()+" fruit</b> and is then spent — mutations are rolled fresh each time you plant.</div>";
   for(var i=0;i<SEEDS.length;i++){
     var S=SEEDS[i];
     var locked = i>0 && ST.evo < i-1 && ST.asc===0;
@@ -4438,6 +4496,14 @@ function renderSupplies(){
     var A=GROVE_AUTO[k], own=!!ST.grove.auto[A.k];
     h+="<div class='card"+(own?"":(ST.tokens>=A.c?"":" locked"))+"'><div class='row'><div style='flex:1'><h3>"+A.n+"</h3><div class='d'>"+A.d+"</div></div>"+
        (own?"<span class='pill g'>ON</span>":btn(fmtInt(A.c)+" 🍃","gold","groveauto",[A.k], ST.tokens<A.c))+"</div></div>";
+  }
+  h+="<div class='tagline'>Grove upgrades</div>";
+  for(var g=0;g<GROVE_UP.length;g++){
+    var U=GROVE_UP[g], ulv=groveUp(U.k), umax=ulv>=U.max, uc=Math.ceil(U.c*Math.pow(U.scale,ulv));
+    h+="<div class='card"+(umax?"":(ST.tokens>=uc?"":" locked"))+"'><div class='row'><div style='flex:1'><h3>"+U.n+
+       (ulv?(" <span class='pill'>Lv "+ulv+"/"+U.max+"</span>"):"")+"</h3><div class='d'>"+U.d+
+       " Every tree currently gives <b>"+treeYield()+"</b> fruit.</div></div>"+
+       (umax?"<span class='pill g'>MAXED</span>":btn(fmtInt(uc)+" 🍃","gold","groveup",[U.k], ST.tokens<uc))+"</div></div>";
   }
   return h;
 }
@@ -4672,6 +4738,15 @@ var ACT = {
     sfx("buy"); toast(F.n+" applied to plot "+(GROVESEL+1)+".","good"); UI.refresh();
     if(ST.grove.plots[GROVESEL]) buildGroveVisual(GROVESEL);
   },
+  groveup:function(k){
+    var U=GROVE_UP.filter(function(x){return x.k===k;})[0], lv=groveUp(k);
+    if(!U || lv>=U.max) return;
+    var c=Math.ceil(U.c*Math.pow(U.scale,lv));
+    if(ST.tokens<c) return; ST.tokens-=c;
+    if(!ST.grove.up) ST.grove.up={};
+    ST.grove.up[k]=lv+1;
+    sfx("big"); toast(U.n+" Lv "+(lv+1)+" — every tree now gives "+treeYield()+" fruit.","gold"); UI.refresh();
+  },
   groveauto:function(k){
     var A=GROVE_AUTO.filter(function(x){return x.k===k;})[0];
     if(ST.tokens<A.c) return; ST.tokens-=A.c; ST.grove.auto[k]=1; sfx("big"); toast(A.n+" online.","gold"); UI.refresh();
@@ -4760,6 +4835,7 @@ function frame(){
   phoneTick(dt);
   groveTick(dt);
   invasionTick(dt);
+  autoRebirthTick();
 
   // ambient animation
   if(STATIONOBJ.orb) STATIONOBJ.orb.rotation.y += dt*0.7;
