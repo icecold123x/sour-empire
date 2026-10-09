@@ -534,19 +534,40 @@ var MUTS = [
 ];
 var FERTS = [
  {k:"myst", n:"Mystery Compost",   c:20,    d:"Rolls +2 extra mutations on the next plant."},
- {k:"grow", n:"Growth Tonic",      c:100,   d:"Permanent +50% growth speed on one plot."},
+ {k:"grow", n:"Growth Tonic",      c:100,   rep:2.5, d:"Permanent +50% growth speed on one plot."},
  {k:"clean",n:"Cleansing Wash",    c:500,   d:"Strips one random mutation from a tree."},
- {k:"irr",  n:"Irrigation Kit",    c:2500,  d:"Permanent ×2 growth speed on one plot."},
- {k:"soil", n:"Soil Enricher",     c:1.2e4, d:"Another ×2 growth speed on one plot."},
- {k:"uran", n:"Enriched Pith",     c:4e4,   d:"Guarantees +2 mutations, forever, on one plot."},
- {k:"clov", n:"Lucky Clovers",     c:1.5e5, d:"Doubles rare-mutation chance on one plot."},
- {k:"asc",  n:"Ascendant Bloom",   c:7.7e5, d:"Guarantees at least one GOOD mutation. Forever."}
+ {k:"irr",  n:"Irrigation Kit",    c:2500,  rep:3,   d:"Permanent ×2 growth speed on one plot."},
+ {k:"soil", n:"Soil Enricher",     c:1.2e4, rep:3,   d:"Another ×2 growth speed on one plot."},
+ {k:"uran", n:"Enriched Pith",     c:4e4,   once:1,  d:"Guarantees +2 mutations, forever, on one plot."},
+ {k:"clov", n:"Lucky Clovers",     c:1.5e5, once:1,  d:"Doubles rare-mutation chance on one plot."},
+ {k:"asc",  n:"Ascendant Bloom",   c:7.7e5, once:1,  d:"Guarantees at least one GOOD mutation. Forever."}
 ];
 var GROVE_AUTO = [
  {k:"autoplant", n:"Auto-Planter",  c:5e5,  d:"Replants the last seed automatically."},
  {k:"autoharv",  n:"Auto-Harvester",c:2e6,  d:"Harvests ripe trees by itself."},
  {k:"autosell",  n:"Auto-Broker",   c:8e6,  d:"Sells harvested fruit automatically."}
 ];
+/* ---------- Grove balance guards ----------
+   The Grove is the only system here that feeds itself: fruit grown in
+   the Grove multiplies the cash rate, and a bigger cash rate buys more
+   Grove. Multiplying every live buff together left that loop with no
+   fixed point. One 10-star tree, Growth Tonic bought down to the
+   two-second ripen floor and the Auto-Taster came to roughly twenty
+   fresh ×23 multipliers a second, each alive for a minute, all
+   multiplied together -- five seconds of it paid out 56 sexdecillion
+   Backers, more than the rest of the game makes in a lifetime.
+   These four numbers close the loop. Stacking still pays, it just
+   converges: only the best few buffs count, each counts for less than
+   the one above it, the product is capped outright, and a single plot
+   can only be sped up so far. Raise them to loosen the Grove, lower
+   them to tighten it. */
+var BUFF_SLOTS   = 6;     /* most buffs that can be live at once */
+var BUFF_FALLOFF = 0.55;  /* exponent each buff gets relative to the one above */
+var BUFF_CAP     = {cash:100, spd:10, grow:4, luck:8};
+var MGROW_CAP    = 12;    /* ceiling on one plot's permanent growth-speed multiplier */
+var TREE_YIELD   = 15;    /* fruit one tree gives before it is spent and must be replanted */
+var STAR_BASE    = 1.95;  /* multiplier per star -- was 1.6, which made ★10 routine */
+var MUT_RARITY   = 1.0;   /* 1 = a good roll picks evenly across the good table; luck still skews it rare */
 
 /* ---------- Companions ---------- */
 var COMPANIONS = [
@@ -644,7 +665,7 @@ function newState(){
     phone:{next:120, active:null, muted:false},
     invasion:{active:false, phase:0, t:0, next:900, drops:0, blorp:0, meter:0},
     stats:{clicks:0, pickups:0, deals:0, bestCash:B(0), playtime:0},
-    seen:{}, settings:{sciNotation:false, fx:true, sound:true, skipCine:false},
+    seen:{}, settings:{sciNotation:false, fx:true, sound:true, skipCine:false, autoeat:true},
     zone:"home", pos:[0,0,14], paint:{}
   };
 }
@@ -740,10 +761,43 @@ function gatewayGlobal(){
 function gatewaySpeed(){ return ST.gateway>=3?1.5:1; }
 function gatewayPickup(){ return ST.gateway>=4?3:1; }
 
+/* Diminishing, capped, and only the best BUFF_SLOTS count -- see the
+   Grove balance guards above for why a plain product was unplayable. */
 function groveBuffMult(kind){
-  var m=1, now=nowS();
-  for(var i=0;i<ST.grove.buffs.length;i++){ var b=ST.grove.buffs[i]; if(b.until>now && b[kind]) m*=b[kind]; }
-  return m;
+  var now = nowS(), vals = [], b;
+  for(var i=0;i<ST.grove.buffs.length;i++){
+    b = ST.grove.buffs[i];
+    if(b.until>now && b[kind] && b[kind]!==1) vals.push(b[kind]);
+  }
+  if(!vals.length) return 1;
+  vals.sort(function(x,y){ return y-x; });
+  var m=1, w=1, n=Math.min(vals.length, BUFF_SLOTS);
+  for(var j=0;j<n;j++){ m *= Math.pow(vals[j], w); w *= BUFF_FALLOFF; }
+  var cap = BUFF_CAP[kind];
+  return cap ? Math.min(m, cap) : m;
+}
+/* The stack is pruned as well as discounted. An unbounded array was a
+   problem on its own: globalCashMult() walks it several times a frame
+   and the whole thing goes into the save file. Old saves carrying
+   thousands of buffs are trimmed the first time this runs. */
+function pruneBuffs(){
+  var now = nowS(), out = [];
+  for(var i=0;i<ST.grove.buffs.length;i++) if(ST.grove.buffs[i].until>now) out.push(ST.grove.buffs[i]);
+  if(out.length > BUFF_SLOTS){
+    out.sort(function(a,b){ return (b.cash||1)-(a.cash||1); });
+    out.length = BUFF_SLOTS;
+  }
+  ST.grove.buffs = out;
+}
+/* True when eating a fruit worth this much cash would actually change
+   the stack, rather than being binned by the next prune. */
+function buffWouldHelp(cash){
+  var now=nowS(), worst=Infinity, live=0;
+  for(var i=0;i<ST.grove.buffs.length;i++){
+    var b=ST.grove.buffs[i];
+    if(b.until>now){ live++; worst=Math.min(worst,(b.cash||1)); }
+  }
+  return live < BUFF_SLOTS || cash > worst;
 }
 function weatherMult(){ var w=weatherDef(); return w.mult; }
 function weatherDef(){ for(var i=0;i<WEATHERS.length;i++) if(WEATHERS[i].k===ST.weather) return WEATHERS[i]; return WEATHERS[0]; }
@@ -3526,10 +3580,34 @@ function harvestVine(){
 }
 
 /* =====================  RESETS  ===================== */
+/* The Grove used to survive every reset in the game, which made it the
+   one permanent power source: breed a good tree once and it paid out
+   through Rebirths, Descents and Ascensions alike. It now unwinds in
+   step with everything else. A Rebirth clears what you are holding, a
+   Descent uproots the trees, an Ascension strips the soil back to bare
+   plots. Tokens, plots and bought automation always survive -- the
+   Grove is reset, not confiscated. */
+function groveReset(level){
+  ST.grove.buffs = [];
+  ST.grove.held = [];
+  if(level < 1 || !ST.grove.unlocked) return;
+  var uprooted = 0;
+  for(var i=0;i<ST.grove.plots.length;i++){
+    var p = ST.grove.plots[i]; if(!p) continue;
+    if(!p.empty) uprooted++;
+    ST.grove.plots[i] = {empty:true, seed:p.seed||0, t:0, ripe:false, muts:[], stars:0, n:0,
+      mGrow: level>1 ? 1 : (p.mGrow||1),
+      f_uran: level>1?0:p.f_uran, f_clov: level>1?0:p.f_clov, f_asc: level>1?0:p.f_asc,
+      pendingMyst:false, fertN: level>1?{}:(p.fertN||{})};
+    buildGroveVisual(i);
+  }
+  if(uprooted) toast("The Grove is bare again — "+uprooted+" tree"+(uprooted>1?"s":"")+" uprooted"+(level>1?", soil stripped":"")+". Your plots, tokens and automation stay.","bad");
+}
 function doRebirth(){
   var n = backersFromRebirth();
   if(n<1){ toast("Not enough accumulated wealth yet.","bad"); return; }
   ST.backers += n; ST.backersLifetime += n; ST.rebirths++;
+  groveReset(0);
   softReset(false);
   banner("REBIRTH — +"+fmtInt(n)+" BACKERS", 4200); sfx("big");
   if(ST.rebirths===1) cine("THE BACKERS ARRIVE","A saucer the size of a shed parks on your lawn. Nobody reacts.\n\nThey liquidate your entire operation and hand you "+fmtInt(n)+" tiny investors who each take 1% interest in everything you will ever earn.\n\nPowers are now available. Build it again — faster.");
@@ -3542,6 +3620,7 @@ function doEvolve(){
   ST.backers = 0;
   ST.powers = {};
   if(hasPower("dilate")) ST.powers.dilate=1;
+  groveReset(1);
   softReset(true);
   var f = FRUITS[Math.min(9,ST.evo)];
   banner("DESCENT "+ST.evo+" — "+f.name.toUpperCase(), 5000); sfx("void");
@@ -3555,6 +3634,7 @@ function doAscend(){
   ST.foreverSlots++;
   if(ST.gateway>=7) gainCharge();
   if(ST.asc>5) ST.cosmic += Math.floor(1+ (ST.asc-5)*0.5);
+  groveReset(2);
   softReset(true);
   banner("ASCENSION "+ST.asc+" — ×7.77 CASH / ×3.33 PRICES", 5200); sfx("big");
   if(ST.asc===1) cine("ASCENSION","The Spire ends in a door, and the door ends in you.\n\nEverything below is unmade: the Descents, the Backers, the Spire itself.\n\nWhat remains is a permanent ×7.77 to all cash — and a permanent ×3.33 to all prices. The world got richer and more expensive at once. Do it again.");
@@ -3579,7 +3659,7 @@ function softReset(deep){
     if(SOURCES[+pp[0]].ups[+pp[1]].kind==="manager") ST.src[+pp[0]].mgr=true;
     ST.src[+pp[0]].owned = true; }
   applyDecos();
-  if(deep){ ST.gateway = ST.gateway; } // gateway & charge & cosmic & grove persist
+  if(deep){ ST.gateway = ST.gateway; } // gateway, charge and cosmic persist; the Grove is unwound by groveReset()
   save();
 }
 
@@ -3669,7 +3749,14 @@ function rollMutations(plot){
     var pool = MUTS.filter(function(m){ return !!m.good === good; });
     // rarer (later in array) mutations weighted by luck
     var idx;
-    if(good){ var r=Math.random()/(lucky*mutLuck()*0.7+0.3); idx = Math.min(pool.length-1, Math.floor(Math.pow(r,1.7)*pool.length)); idx = pool.length-1-idx; }
+    /* The exponent decides how often a good roll lands on the far end
+       of the table -- Perfect, Pure, Blessed. At 1.7 roughly a quarter
+       of every good roll landed in the top tenth, and a bare plot threw
+       a ★10 tree 3.7% of the time, which is why one could be bred on
+       purpose in an afternoon. At 1 the roll is even and luck does the
+       skewing: a bare plot never reaches ★10 across 40,000 plants, a
+       fully fertilised one manages it about one plant in fifty. */
+    if(good){ var r=Math.random()/(lucky*mutLuck()*0.7+0.3); idx = Math.min(pool.length-1, Math.floor(Math.pow(r,MUT_RARITY)*pool.length)); idx = pool.length-1-idx; }
     else idx = Math.floor(Math.random()*pool.length);
     var nm = pool[idx].n;
     if(out.indexOf(nm)<0) out.push(nm);
@@ -3692,30 +3779,50 @@ function plotStats(p){
 function plotStars(p){
   if(!p||!p.muts) return 0;
   var s = plotStats(p);
-  var score = Math.log10(Math.max(1.01, s.cash*s.val*s.spd)) / Math.log10(1.6);
+  var score = Math.log10(Math.max(1.01, s.cash*s.val*s.spd)) / Math.log10(STAR_BASE);
   var neg = p.muts.filter(function(n){ var m=MUTS.filter(function(x){return x.n===n;})[0]; return m&&!m.good; }).length;
   return Math.max(1, Math.min(10, Math.round(score - neg*1.2)));
 }
 function growTime(p){
   var seed = SEEDS[p.seed];
   var t = seed.grow;
-  t /= (p.mGrow||1);
+  /* Clamped here rather than at the purchase, so a plot that was
+     fertilised past the cap by an older build -- or that carries an
+     inflated multiplier forward through a replant -- is held to the
+     same ceiling as everyone else. */
+  t /= Math.min(MGROW_CAP, p.mGrow||1);
   var st = plotStats(p); t *= st.grow;
   if(ST.weather==="rain") t /= 2;
   t /= (groveBuffMult("grow")||1);
   return Math.max(2, t);
 }
-function plantSeed(idx, seedId){
+/* Growth fertilisers used to be a flat price with no limit, so the
+   honest reading of the Supplies tab was "pay 100 tokens for +50%
+   growth, repeat until the tree ripens on the two-second floor".
+   Repeats now cost more each time and a plot tops out at MGROW_CAP,
+   and the one-shot fertilisers refuse a second sale rather than
+   quietly eating the tokens. */
+function fertCount(p,k){ return (p && p.fertN && p.fertN[k]) || 0; }
+function fertCost(F,p){ return F.rep ? Math.ceil(F.c * Math.pow(F.rep, fertCount(p,F.k))) : F.c; }
+function fertBlocked(p,F){
+  if(!p) return null;
+  if(F.rep && (p.mGrow||1) >= MGROW_CAP-1e-9) return "That plot is already at the growth cap (×"+MGROW_CAP+").";
+  if(F.once && p["f_"+F.k]) return F.n+" is already on that plot.";
+  if(F.k==="myst" && p.pendingMyst) return "Mystery Compost is already loaded on that plot.";
+  if(F.k==="clean" && !(p.muts&&p.muts.length)) return "That plot has no mutations to strip.";
+  return null;
+}
+function plantSeed(idx, seedId, auto){
   var p = ST.grove.plots[idx];
   var cost = SEEDS[seedId].cost;
   if(ST.tokens < cost){ toast("Need "+fmtInt(cost)+" Grove Tokens","bad"); return; }
   ST.tokens -= cost;
-  var keep = {mGrow:p?p.mGrow:1, f_uran:p?p.f_uran:0, f_clov:p?p.f_clov:0, f_asc:p?p.f_asc:0, pendingMyst:p?p.pendingMyst:false};
-  var np = {seed:seedId, t:0, ripe:false, muts:[], mGrow:keep.mGrow||1, f_uran:keep.f_uran, f_clov:keep.f_clov, f_asc:keep.f_asc, pendingMyst:keep.pendingMyst, stars:0};
+  var keep = {mGrow:p?p.mGrow:1, f_uran:p?p.f_uran:0, f_clov:p?p.f_clov:0, f_asc:p?p.f_asc:0, pendingMyst:p?p.pendingMyst:false, fertN:p?p.fertN:null};
+  var np = {seed:seedId, t:0, ripe:false, muts:[], mGrow:keep.mGrow||1, f_uran:keep.f_uran, f_clov:keep.f_clov, f_asc:keep.f_asc, pendingMyst:keep.pendingMyst, fertN:keep.fertN||{}, stars:0, n:0};
   np.muts = rollMutations(np);
   np.stars = plotStars(np);
   ST.grove.plots[idx]=np; ST.grove.lastSeed=seedId;
-  sfx("buy");
+  if(!auto) sfx("buy");
   if(np.stars>=9) toast("★"+np.stars+" tree! "+np.muts.join(", "),"gold");
   buildGroveVisual(idx);
   checkCompanions();
@@ -3723,25 +3830,55 @@ function plantSeed(idx, seedId){
 function groveTick(dt){
   if(!ST.grove.unlocked) return;
   for(var i=0;i<ST.grove.plots.length;i++){
-    var p = ST.grove.plots[i]; if(!p) continue;
+    var p = ST.grove.plots[i];
+    if(!p || p.empty){
+      /* Auto-Planter cost half a million tokens and was wired to
+         nothing: harvesting never clears a plot, so the only empty
+         plots are ones you just bought, and nothing ever filled them.
+         Give it the job printed on the box. */
+      if(ST.grove.auto.autoplant){
+        var sid = ST.grove.lastSeed||0;
+        if(ST.tokens >= SEEDS[sid].cost) plantSeed(i, sid, true);
+      }
+      continue;
+    }
     if(!p.ripe){
       p.t += dt;
       if(p.t >= growTime(p)){ p.ripe=true; buildGroveVisual(i); }
     } else if(ST.grove.auto.autoharv){ harvestPlot(i, true); }
   }
-  // buffs expiry
-  var now=nowS();
-  ST.grove.buffs = ST.grove.buffs.filter(function(b){ return b.until>now; });
+  pruneBuffs();
+}
+/* Strips the tree off a plot but leaves everything the plot itself
+   owns -- fertilisers are sold as permanent on the plot, and they are. */
+function spendPlot(i){
+  var p = ST.grove.plots[i]; if(!p) return;
+  ST.grove.plots[i] = {empty:true, seed:p.seed, t:0, ripe:false, muts:[], stars:0, n:0,
+    mGrow:p.mGrow||1, f_uran:p.f_uran, f_clov:p.f_clov, f_asc:p.f_asc,
+    pendingMyst:p.pendingMyst, fertN:p.fertN};
+  buildGroveVisual(i);
 }
 function harvestPlot(i, auto){
-  var p = ST.grove.plots[i]; if(!p||!p.ripe) return;
+  var p = ST.grove.plots[i]; if(!p||p.empty||!p.ripe) return;
   var st = plotStats(p);
   var val = Math.max(1, Math.round(SEEDS[p.seed].val * st.val));
   ST.grove.held.push({seed:p.seed, muts:p.muts.slice(), val:val, stars:p.stars});
   p.ripe=false; p.t=0;
   if(!auto){ sfx("pick"); floater("🍋 harvested","#ffd166"); }
+  /* A tree is a crop, not an engine. It gives TREE_YIELD fruit and is
+     spent, and its mutations die with it -- so a freak ★10 is a
+     windfall to cash in, not a permanent income you breed once and
+     ride forever. */
+  p.n = (p.n||0)+1;
+  if(p.n >= TREE_YIELD){
+    spendPlot(i);
+    if(!ST.grove.auto.autoplant) toast("Plot "+(i+1)+" is spent after "+TREE_YIELD+" fruit. Replant it.","bad");
+    if(hasPower("taster") && ST.settings.autoeat!==false) autoEat();
+    if(ST.grove.auto.autosell) sellAllFruit(true);
+    return;
+  }
   buildGroveVisual(i);
-  if(hasPower("taster")) autoEat();
+  if(hasPower("taster") && ST.settings.autoeat!==false) autoEat();
   if(ST.grove.auto.autosell) sellAllFruit(true);
 }
 function sellAllFruit(quiet){
@@ -3754,17 +3891,25 @@ function sellAllFruit(quiet){
 function eatFruit(i){
   var f = ST.grove.held[i]; if(!f) return;
   var st = plotStats(f);
+  /* Eating into a full stack of better fruit used to silently delete
+     the fruit for no buff. Keep it in the basket instead. */
+  if(!buffWouldHelp(st.cash)){ toast("All "+BUFF_SLOTS+" buff slots hold better fruit. Saved this one for later.","bad"); return; }
   var dur = 60;
   ST.grove.buffs.push({until:nowS()+dur, cash:st.cash, spd:st.spd, grow:1/Math.max(0.1,st.grow), luck:st.luck});
+  pruneBuffs();
   ST.grove.held.splice(i,1);
   sfx("sell");
   toast("Ate a "+SEEDS[f.seed].n+": ×"+st.cash.toFixed(2)+" cash, ×"+st.spd.toFixed(2)+" speed for 60s.","gold");
 }
 function autoEat(){
+  /* With the stack bounded there is no sense force-feeding the player
+     everything they own -- once the slots hold better fruit, eating
+     more only bins it. Eat the best, stop when it stops paying. */
   while(ST.grove.held.length>0){
     var best=0;
     for(var i=1;i<ST.grove.held.length;i++) if(plotStats(ST.grove.held[i]).cash > plotStats(ST.grove.held[best]).cash) best=i;
-    if(plotStats(ST.grove.held[best]).cash > 1.2) eatFruit(best);
+    var c = plotStats(ST.grove.held[best]).cash;
+    if(c > 1.2 && buffWouldHelp(c)) eatFruit(best);
     else break;
   }
   if(ST.grove.auto.autosell) sellAllFruit(true);
@@ -3773,7 +3918,7 @@ function buildGroveVisual(i){
   var t = GROVEOBJ.trees[i]; if(!t) return;
   while(t.grp.children.length) t.grp.remove(t.grp.children[0]);
   var p = ST.grove.plots[i];
-  if(!p) return;
+  if(!p || p.empty) return;
   var pr = Math.min(1, p.t/growTime(p));
   var h = 2 + pr*7;
   t.grp.add(cyl(0.6,0.8,h,0x6b4a2f,0,h/2,0,8));
@@ -4237,16 +4382,25 @@ function renderPlots(){
   if(!ST.grove.unlocked) return "<div class='card locked'><h3>The Grove is closed</h3><div class='d'>Unlocks automatically once your empire is large enough.</div></div>";
   var h="<div class='card'><div class='d'>Grove Tokens: <b class='tok'>"+fmtInt(ST.tokens)+"</b> — a closed economy. Tokens never convert to cash and cash never buys them.</div>"+
     "<div class='d'>Plots owned: <b>"+ST.grove.nplots+" / 24</b></div>"+
-    (ST.grove.nplots<24?("<div class='row' style='margin-top:8px'><div class='d'>Next plot</div>"+btn(fmtInt(bToNum(plotCost(ST.grove.nplots)))+" 🍃","gold","plotbuy",[], ST.tokens<bToNum(plotCost(ST.grove.nplots)))+"</div>"):"")+"</div>";
+    (ST.grove.nplots<24?("<div class='row' style='margin-top:8px'><div class='d'>Next plot</div>"+btn(fmtInt(bToNum(plotCost(ST.grove.nplots)))+" 🍃","gold","plotbuy",[], ST.tokens<bToNum(plotCost(ST.grove.nplots)))+"</div>"):"")+
+    /* Players keep asking for an auto-harvester that has been on sale
+       the whole time, three screens deep under the fertilisers. Say so
+       on the screen where the clicking actually happens. */
+    (ST.grove.auto.autoharv?"":"<div class='d' style='margin-top:8px'>🤖 Tired of clicking HARVEST? The <b>Supplies</b> tab sells an <b>Auto-Planter</b>, an <b>Auto-Harvester</b> and an <b>Auto-Broker</b> under <i>Automation</i>.</div>")+"</div>";
   h+="<div class='grid3'>";
   for(var i=0;i<ST.grove.nplots;i++){
     var p = ST.grove.plots[i];
-    if(!p){ h += "<div class='plot empty'><div class='pn'>Plot "+(i+1)+"</div><div class='d'>Empty</div>"+btn("PLANT","","plantui",[i])+"</div>"; continue; }
+    if(!p || p.empty){
+      h += "<div class='plot empty'><div class='pn'>Plot "+(i+1)+"</div><div class='d'>Empty"+
+           (p&&p.mGrow>1?(" · fertilised ×"+p.mGrow.toFixed(2)+" growth"):"")+"</div>"+btn("PLANT","","plantui",[i])+"</div>";
+      continue;
+    }
     var pr = Math.min(1,p.t/growTime(p));
     var st = plotStats(p);
     h += "<div class='plot'><div class='pn'>"+SEEDS[p.seed].n+" <span class='pill'>★"+p.stars+"</span></div>";
     h += "<div>"+p.muts.map(function(m){ var mm=MUTS.filter(function(x){return x.n===m;})[0]; return "<span class='mut"+(mm&&mm.good?"":" bad")+"'>"+m+"</span>"; }).join("")+"</div>";
     h += "<div class='d'>value ×"+st.val.toFixed(2)+" · cash ×"+st.cash.toFixed(2)+" · speed ×"+st.spd.toFixed(2)+"</div>";
+    h += "<div class='d'>fruit <b>"+(p.n||0)+" / "+TREE_YIELD+"</b> before the tree is spent</div>";
     h += p.ripe ? ("<div class='pill g'>RIPE</div>"+btn("HARVEST","gold","harvest",[i])) : ("<div class='bar'><i style='width:"+(pr*100)+"%'></i></div><div class='d'>"+fmtTime(growTime(p)-p.t)+"</div>");
     h += btn("REPLANT","","plantui",[i]);
     h += "</div>";
@@ -4255,7 +4409,7 @@ function renderPlots(){
   return h;
 }
 function renderSeeds(){
-  var h="<div class='d' style='margin-bottom:8px'>Seeds cost Grove Tokens. Higher tiers grow slower but sell for far more, and mutations multiply on top.</div>";
+  var h="<div class='d' style='margin-bottom:8px'>Seeds cost Grove Tokens. Higher tiers grow slower but sell for far more, and mutations multiply on top. Every tree gives <b>"+TREE_YIELD+" fruit</b> and is then spent — mutations are rolled fresh each time you plant.</div>";
   for(var i=0;i<SEEDS.length;i++){
     var S=SEEDS[i];
     var locked = i>0 && ST.evo < i-1 && ST.asc===0;
@@ -4270,10 +4424,14 @@ function renderSupplies(){
   h+="<div class='card'><div class='d'>Selected plot: <b>"+(GROVESEL>=0?("Plot "+(GROVESEL+1)):"none")+"</b></div><div class='grid3' style='margin-top:6px'>";
   for(var i=0;i<ST.grove.nplots;i++) h+= "<button class='buy"+(GROVESEL===i?" gold":"")+"' data-a='selplot' data-p='"+i+"'>"+(i+1)+"</button>";
   h+="</div></div>";
+  var selp = GROVESEL>=0 ? ST.grove.plots[GROVESEL] : null;
   for(var j=0;j<FERTS.length;j++){
     var F=FERTS[j];
-    h+="<div class='card"+(ST.tokens>=F.c?"":" locked")+"'><div class='row'><div style='flex:1'><h3>"+F.n+"</h3><div class='d'>"+F.d+"</div></div>"+
-       btn(fmtInt(F.c)+" 🍃","gold","fert",[F.k], ST.tokens<F.c||GROVESEL<0)+"</div></div>";
+    var why = fertBlocked(selp,F), fc = fertCost(F,selp), stop = !!why||ST.tokens<fc||GROVESEL<0;
+    h+="<div class='card"+(stop?" locked":"")+"'><div class='row'><div style='flex:1'><h3>"+F.n+"</h3><div class='d'>"+F.d+
+       (F.rep?(" Each repeat on the same plot costs ×"+F.rep+" more, and a plot stops at ×"+MGROW_CAP+" growth."):"")+
+       (why?("<br><b>"+why+"</b>"):"")+"</div></div>"+
+       btn(fmtInt(fc)+" 🍃","gold","fert",[F.k], stop)+"</div></div>";
   }
   h+="<div class='tagline'>Automation</div>";
   for(var k=0;k<GROVE_AUTO.length;k++){
@@ -4284,10 +4442,17 @@ function renderSupplies(){
   return h;
 }
 function renderBasket(){
-  var h="<div class='card'><div class='row'><div><h3>Basket: "+ST.grove.held.length+" fruit</h3><div class='d'>Sell for tokens, or eat for a 60-second buff built from the fruit's mutations."+(hasPower("taster")?" Auto-Taster is eating the good ones for you.":"")+"</div></div>"+btn("SELL ALL","gold","sellall")+"</div></div>";
+  var on = ST.settings.autoeat!==false;
+  var h="<div class='card'><div class='row'><div><h3>Basket: "+ST.grove.held.length+" fruit</h3><div class='d'>Sell for tokens, or eat for a 60-second buff built from the fruit's mutations."+
+    (hasPower("taster")?(on?" Auto-Taster is eating the good ones for you.":" Auto-Taster is switched off — nothing is eaten until you say so."):"")+"</div></div>"+btn("SELL ALL","gold","sellall")+"</div>"+
+    /* Eating is a decision with a cost now that the stack has slots, so
+       the player who wants to hold a perfect fruit for a Rebirth window
+       needs to be able to stop the robot taking it. */
+    (hasPower("taster")?("<div class='row' style='margin-top:8px'><div class='d'>Auto-Taster</div>"+btn(on?"ON":"OFF",on?"gold":"","toggle",["autoeat"])+"</div>"):"")+"</div>";
   var now=nowS();
   if(ST.grove.buffs.length){
-    h+="<div class='tagline'>Active buffs</div>";
+    h+="<div class='tagline'>Active buffs — ×"+groveBuffMult("cash").toFixed(2)+" cash, ×"+groveBuffMult("spd").toFixed(2)+" speed together ("+
+       BUFF_SLOTS+" slots; every buff past the strongest counts for less)</div>";
     ST.grove.buffs.forEach(function(b){ h+="<div class='card'><div class='d'>×"+b.cash.toFixed(2)+" cash · ×"+b.spd.toFixed(2)+" speed — "+fmtTime(b.until-now)+" left</div></div>"; });
   }
   h+="<div class='grid3'>";
@@ -4485,17 +4650,27 @@ var ACT = {
   fert:function(k){
     if(GROVESEL<0) return;
     var F=FERTS.filter(function(x){return x.k===k;})[0];
-    if(ST.tokens<F.c) return; ST.tokens-=F.c;
-    var p = ST.grove.plots[GROVESEL] || (ST.grove.plots[GROVESEL]={seed:0,t:0,ripe:false,muts:[],mGrow:1,stars:0});
+    /* Fertilising a bare plot records the treatment, it does not grow a
+       tree there -- that used to hand out a free Common Zest, seed cost
+       skipped, for the price of one compost. */
+    var p = ST.grove.plots[GROVESEL] || (ST.grove.plots[GROVESEL]={empty:true,seed:0,t:0,ripe:false,muts:[],mGrow:1,stars:0});
+    var why = fertBlocked(p,F);
+    if(why){ toast(why,"bad"); return; }
+    var cost = fertCost(F,p);
+    if(ST.tokens<cost) return; ST.tokens-=cost;
+    if(!p.fertN) p.fertN={};
+    p.fertN[k]=(p.fertN[k]||0)+1;
     if(k==="grow") p.mGrow=(p.mGrow||1)*1.5;
     if(k==="irr")  p.mGrow=(p.mGrow||1)*2;
     if(k==="soil") p.mGrow=(p.mGrow||1)*2;
+    if(F.rep) p.mGrow=Math.min(MGROW_CAP, p.mGrow);
     if(k==="myst") p.pendingMyst=true;
     if(k==="uran") p.f_uran=1;
     if(k==="clov") p.f_clov=1;
     if(k==="asc")  p.f_asc=1;
     if(k==="clean" && p.muts.length){ var bad=p.muts.findIndex(function(n){ var m=MUTS.filter(function(x){return x.n===n;})[0]; return m&&!m.good; }); p.muts.splice(bad>=0?bad:0,1); p.stars=plotStars(p); }
     sfx("buy"); toast(F.n+" applied to plot "+(GROVESEL+1)+".","good"); UI.refresh();
+    if(ST.grove.plots[GROVESEL]) buildGroveVisual(GROVESEL);
   },
   groveauto:function(k){
     var A=GROVE_AUTO.filter(function(x){return x.k===k;})[0];
